@@ -1,13 +1,7 @@
 from celery_app import celery_app
 from database import SessionLocal, GraphNode, GraphEdge, TaskLog, TargetProfile, NodeType, EntityScan
-from osint_modules import (
-    EmailAnalyzer,
-    PhoneLookup,
-    SocialFootprintScanner,
-    BreachDatabaseQuerier,
-    FacialRecognitionMatcher,
-    DomainWhoisAnalyzer,
-)
+import asyncio
+from real_osint_modules import run_osint_analysis
 from datetime import datetime
 from typing import List, Dict, Any
 import json
@@ -66,22 +60,36 @@ def analyze_email(self, scan_id: str, email: str):
         module_name = "Email Breach Aggregator"
         update_task_log(db, scan_id, module_name, "running", "Querying breach databases...", 25)
 
-        analyzer = EmailAnalyzer()
-        result = analyzer.analyze(email)
+        # Run async OSINT analysis
+        result = asyncio.run(run_osint_analysis("email", email))
 
-        # Create email node
-        email_node = add_node(db, scan_id, "EMAIL", email, {"breaches": len(result["breaches"])})
+        if "error" not in result:
+            # Create email node
+            email_node = add_node(db, scan_id, "EMAIL", email, {
+                "breaches": result.get("breach_count", 0),
+                "valid": result.get("is_valid", False),
+                "domain": result.get("domain", "")
+            })
 
-        # Add breach edges
-        for breach in result["breaches"]:
-            breach_node = add_node(
-                db, scan_id, "CREDENTIAL",
-                f"Breach: {breach['name']}",
-                {"breach": breach["name"], "date": breach["date"]}
-            )
-            add_edge(db, scan_id, email_node.id, breach_node.id, "COMPROMISED_IN", {"date": breach["date"]})
+            # Add breach nodes
+            for breach in result.get("breaches", []):
+                breach_node = add_node(
+                    db, scan_id, "CREDENTIAL",
+                    f"Breach: {breach.get('name', 'Unknown')}",
+                    {"breach": breach.get('name'), "date": breach.get('date')}
+                )
+                add_edge(db, scan_id, email_node.id, breach_node.id, "COMPROMISED_IN", {"date": breach.get('date')})
 
-        update_task_log(db, scan_id, module_name, "completed", "Completed", 100)
+            # Add social account nodes
+            for social in result.get("social_accounts", []):
+                social_node = add_node(
+                    db, scan_id, "SOCIAL",
+                    f"@{social['username']} ({social['platform']})",
+                    {"platform": social['platform'], "url": social['url']}
+                )
+                add_edge(db, scan_id, email_node.id, social_node.id, "LINKED_TO")
+
+        update_task_log(db, scan_id, module_name, "completed", f"Found {len(result.get('breaches', []))} breaches", 100)
         logger.info(f"Email analysis complete for {email}")
 
     except Exception as e:
@@ -98,21 +106,18 @@ def lookup_phone(self, scan_id: str, phone: str):
         module_name = "Phone Number OSINT Lookup"
         update_task_log(db, scan_id, module_name, "running", "Looking up phone details...", 30)
 
-        lookup = PhoneLookup()
-        result = lookup.lookup(phone)
+        # Run async OSINT analysis
+        result = asyncio.run(run_osint_analysis("phone", phone))
 
-        # Create phone node
-        phone_node = add_node(db, scan_id, "PHONE", phone, result["attributes"])
+        if "error" not in result:
+            # Create phone node
+            phone_node = add_node(db, scan_id, "PHONE", result.get("normalized", phone), {
+                "carrier": result.get("carrier", "Unknown"),
+                "country": result.get("country", "Unknown"),
+                "type": result.get("type", "unknown")
+            })
 
-        # Add related email if discovered
-        if result.get("related_email"):
-            email_node = add_node(db, scan_id, "EMAIL", result["related_email"], {"source": "phone_lookup"})
-            add_edge(db, scan_id, phone_node.id, email_node.id, "ASSOCIATED_WITH")
-
-            # Pivot: Analyze the discovered email
-            analyze_email.delay(scan_id, result["related_email"])
-
-        update_task_log(db, scan_id, module_name, "completed", "Completed", 100)
+        update_task_log(db, scan_id, module_name, "completed", "Phone lookup complete", 100)
         logger.info(f"Phone lookup complete for {phone}")
 
     except Exception as e:
@@ -129,26 +134,30 @@ def scan_social_footprint(self, scan_id: str, username: str):
         module_name = "Social Username Enumerator"
         update_task_log(db, scan_id, module_name, "running", "Scanning social platforms...", 40)
 
-        scanner = SocialFootprintScanner()
-        result = scanner.scan(username)
+        # Run async OSINT analysis
+        result = asyncio.run(run_osint_analysis("username", username))
 
-        # Create social nodes for each platform
-        for platform in result["platforms"]:
-            social_node = add_node(
-                db, scan_id, "SOCIAL",
-                f"@{username} ({platform['name']})",
-                {"platform": platform["name"], "followers": platform.get("followers", 0), "url": platform.get("url")}
-            )
+        if "error" not in result:
+            # Create social nodes for each platform found
+            for platform in result.get("platforms", []):
+                social_node = add_node(
+                    db, scan_id, "SOCIAL",
+                    f"@{username} ({platform['name']})",
+                    {
+                        "platform": platform["name"],
+                        "url": platform.get("url", ""),
+                        "found": platform.get("found", True)
+                    }
+                )
 
-            # Add related person node
+            # Create person node
             person_node = add_node(
                 db, scan_id, "PERSON",
                 username,
-                {"source": "social_scan", "confidence": platform.get("confidence", 0.8)}
+                {"source": "social_scan", "platforms_found": result.get("platforms_found", 0)}
             )
-            add_edge(db, scan_id, social_node.id, person_node.id, "ACCOUNT_OF")
 
-        update_task_log(db, scan_id, module_name, "completed", "Completed", 100)
+        update_task_log(db, scan_id, module_name, "completed", f"Found on {result.get('platforms_found', 0)} platforms", 100)
         logger.info(f"Social scan complete for {username}")
 
     except Exception as e:

@@ -30,8 +30,11 @@ const initialState: ScanState = {
 class ScanStore {
   private state: ScanState = { ...initialState };
   private listeners: Set<(state: ScanState) => void> = new Set();
+  private pollingInterval: NodeJS.Timeout | null = null;
+  private wsTimeout: NodeJS.Timeout | null = null;
 
   subscribe(listener: (state: ScanState) => void) {
+    listener(this.state); // Send current state immediately
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
@@ -47,7 +50,7 @@ class ScanStore {
 
   async initializeScan(seeds: SeedInput[]) {
     try {
-      this.setState({ status: 'initializing', seeds, error: null });
+      this.setState({ status: 'initializing', seeds, error: null, progress: 0 });
 
       const request: ScanInitRequest = {
         seeds: seeds.map(s => ({
@@ -72,13 +75,12 @@ class ScanStore {
         // Connect WebSocket for real-time updates
         this.connectWebSocket(scanId);
 
-        // Poll for status updates
+        // Poll for status updates as fallback
         this.startStatusPolling(scanId);
 
         return scanId;
       } catch (apiError) {
         console.warn('Backend API failed, using demo mode:', apiError);
-        // Fall back to demo mode
         return this.initializeDemoScan(seeds);
       }
     } catch (error) {
@@ -99,9 +101,9 @@ class ScanStore {
       nodes: [],
       edges: [],
       profile: null,
+      progress: 0,
     });
 
-    // Simulate task execution with demo data
     const modules = [
       'Email Breach Aggregator',
       'Phone Number OSINT Lookup',
@@ -114,10 +116,12 @@ class ScanStore {
     ];
 
     let taskIndex = 0;
-    const interval = setInterval(() => {
+    let nodeCount = 0;
+
+    const taskInterval = setInterval(() => {
       if (taskIndex >= modules.length) {
-        clearInterval(interval);
-        this.completeDemoScan();
+        clearInterval(taskInterval);
+        setTimeout(() => this.completeDemoScan(), 800);
         return;
       }
 
@@ -131,8 +135,27 @@ class ScanStore {
         timestamp: new Date(),
       };
 
+      // Add a node every 2 tasks
+      if (taskIndex % 2 === 1) {
+        const nodeTypes = ['email', 'person', 'social', 'location', 'credential'];
+        const nodeType = nodeTypes[nodeCount % nodeTypes.length];
+        const node: GraphNode = {
+          id: `n${nodeCount}`,
+          type: nodeType as any,
+          label: `Entity ${nodeCount}`,
+          data: {},
+          confidence: 0.85 + Math.random() * 0.15,
+        };
+
+        this.setState(state => ({
+          nodes: [...state.nodes, node],
+        }));
+        nodeCount++;
+      }
+
       this.setState(state => ({
         tasks: [...state.tasks.filter(t => t.module !== module), task],
+        progress: Math.round(((taskIndex + 1) / modules.length) * 100),
       }));
 
       taskIndex++;
@@ -191,17 +214,30 @@ class ScanStore {
       nodes: demoNodes,
       edges: demoEdges,
       profile: demoProfile,
+      progress: 100,
     });
   }
 
   private connectWebSocket(scanId: string) {
-    const ws = apiClient.connectWebSocket(scanId, {
-      onMessage: (data: unknown) => this.handleWebSocketMessage(data),
-      onError: (error: Error) => this.setState({ error: error.message }),
-      onClose: () => this.setState({ ws: null }),
-    });
+    try {
+      const ws = apiClient.connectWebSocket(scanId, {
+        onMessage: (data: unknown) => this.handleWebSocketMessage(data),
+        onError: (error: Error) => {
+          console.warn('WebSocket error, continuing with polling:', error);
+          this.setState({ error: null }); // Don't show error, continue with polling
+        },
+        onClose: () => {
+          if (this.pollingInterval) {
+            // Polling will continue
+          }
+        },
+      });
 
-    this.setState({ ws });
+      this.setState({ ws });
+    } catch (error) {
+      console.warn('WebSocket connection failed:', error);
+      // Polling will handle it
+    }
   }
 
   private handleWebSocketMessage(data: unknown) {
@@ -226,24 +262,25 @@ class ScanStore {
       }
       case 'profile_updated': {
         const profile = (message as { profile: TargetProfile }).profile;
-        this.setState({ profile });
+        this.setState({ profile, status: 'completed' });
         break;
       }
     }
   }
 
   private updateTaskLog(task: TaskStatus) {
-    const tasks = this.state.tasks.map(t =>
-      t.id === task.id ? task : t
-    );
+    const existingIndex = this.state.tasks.findIndex(t => t.id === task.id);
+    let tasks: TaskStatus[];
+
+    if (existingIndex >= 0) {
+      tasks = [...this.state.tasks];
+      tasks[existingIndex] = task;
+    } else {
+      tasks = [...this.state.tasks, task];
+    }
 
     const completedCount = tasks.filter(t => t.status === 'completed').length;
-    const progress = Math.round((completedCount / tasks.length) * 100) || 0;
-
-    // Add task if it doesn't exist
-    if (!this.state.tasks.find(t => t.id === task.id)) {
-      tasks.push(task);
-    }
+    const progress = tasks.length > 0 ? Math.round((completedCount / tasks.length) * 100) : 0;
 
     this.setState({ tasks, progress });
   }
@@ -265,17 +302,23 @@ class ScanStore {
   }
 
   private startStatusPolling(scanId: string) {
-    const interval = setInterval(async () => {
+    // Clear existing polling interval
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+    }
+
+    this.pollingInterval = setInterval(async () => {
       try {
         const status = await apiClient.getScanStatus(scanId);
 
         this.setState({
           progress: status.progress,
-          status: status.profile_ready ? 'completed' : 'processing',
         });
 
         if (status.profile_ready) {
-          clearInterval(interval);
+          clearInterval(this.pollingInterval!);
+          this.pollingInterval = null;
+
           const results = await apiClient.getScanResults(scanId);
           this.setState({
             profile: results.profile,
@@ -283,18 +326,32 @@ class ScanStore {
             edges: results.edges,
             tasks: results.tasks,
             status: 'completed',
+            progress: 100,
           });
         }
       } catch (error) {
-        console.error('Status polling error:', error);
+        console.warn('Status polling error (will retry):', error);
       }
-    }, 1000);
+    }, 1500);
 
-    // Clear interval after 5 minutes
-    setTimeout(() => clearInterval(interval), 5 * 60 * 1000);
+    // Clear polling after 5 minutes
+    this.wsTimeout = setTimeout(() => {
+      if (this.pollingInterval) {
+        clearInterval(this.pollingInterval);
+        this.pollingInterval = null;
+      }
+    }, 5 * 60 * 1000);
   }
 
   reset() {
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
+    }
+    if (this.wsTimeout) {
+      clearTimeout(this.wsTimeout);
+      this.wsTimeout = null;
+    }
     if (this.state.ws) {
       this.state.ws.close();
     }

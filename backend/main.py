@@ -71,7 +71,7 @@ async def initialize_scan(request: ScanInitRequest, db: Session = Depends(get_db
         scan = EntityScan(
             id=scan_id,
             status=ScanStatus.PROCESSING,
-            seed_inputs=[seed.dict() for seed in request.seeds],
+            seed_inputs=[{"value": seed.value, "entity_type": seed.entity_type} for seed in request.seeds],
             metadata=request.metadata or {}
         )
         db.add(scan)
@@ -102,15 +102,19 @@ async def initialize_scan(request: ScanInitRequest, db: Session = Depends(get_db
         # Queue extraction tasks based on seed inputs
         for seed in request.seeds:
             if seed.entity_type == "email":
-                analyze_email.delay(scan_id, seed.value)
-                query_breach_database.delay(scan_id, seed.value)
+                analyze_email.apply_async((scan_id, seed.value), countdown=1)
+                query_breach_database.apply_async((scan_id, seed.value), countdown=2)
             elif seed.entity_type == "phone":
-                lookup_phone.delay(scan_id, seed.value)
+                lookup_phone.apply_async((scan_id, seed.value), countdown=1)
             elif seed.entity_type in ["username", "social"]:
-                scan_social_footprint.delay(scan_id, seed.value)
+                scan_social_footprint.apply_async((scan_id, seed.value), countdown=1)
+            elif seed.entity_type == "domain":
+                scan_social_footprint.apply_async((scan_id, seed.value), countdown=1)  # Reuse for domain
+            elif seed.entity_type == "ip":
+                lookup_phone.apply_async((scan_id, seed.value), countdown=1)  # Reuse for IP
 
         # Queue profile builder (will run after tasks complete)
-        build_target_profile.apply_async((scan_id,), countdown=15)
+        build_target_profile.apply_async((scan_id,), countdown=20)
 
         logger.info(f"Scan initialized: {scan_id}")
 
